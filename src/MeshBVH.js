@@ -1,4 +1,4 @@
-import { Vector3, BufferAttribute, Box3 } from 'three';
+import { Vector3, BufferAttribute, Box3, Matrix4 } from 'three';
 import { CENTER } from './Constants.js';
 import { BYTES_PER_NODE, IS_LEAFNODE_FLAG, buildPackedTree } from './buildFunctions.js';
 import { OrientedBox } from './Utils/OrientedBox.js';
@@ -8,9 +8,11 @@ import {
 	raycast,
 	raycastFirst,
 	shapecast,
-	intersectsGeometry,
 	setBuffer,
 	clearBuffer,
+	setBuffer2,
+	clearBuffer2,
+	bvhcast,
 } from './castFunctions.js';
 import { arrayToBox, iterateOverTriangles } from './Utils/BufferNodeUtils.js';
 
@@ -342,23 +344,158 @@ export default class MeshBVH {
 
 	intersectsGeometry( mesh, otherGeometry, geomToMesh ) {
 
+		const otherBvh = otherGeometry.boundsTree;
+		const meshToGeom = new Matrix4().copy( geomToMesh ).invert();
 		const geometry = this.geometry;
-		let result = false;
-		for ( const root of this._roots ) {
 
-			setBuffer( root );
-			result = intersectsGeometry( 0, mesh, geometry, otherGeometry, geomToMesh );
-			clearBuffer();
+		const indexAttr = geometry.index;
+		const posAttr = geometry.attributes.position;
+		const otherIndexAttr = otherGeometry.index;
+		const otherPosAttr = otherGeometry.attributes.position;
 
-			if ( result ) {
+		if ( otherBvh ) {
 
-				break;
+			let result = false;
+			let byteOffset = 0;
+			for ( const root of this._roots ) {
+
+				setBuffer( root );
+
+				let otherByteOffset = 0;
+				for ( const otherRoot of otherBvh._roots ) {
+
+					setBuffer2( otherRoot );
+					result = bvhcast(
+						0, 0,
+
+						( box1, box2, score ) => {
+
+							return score <= 0;
+
+						},
+
+						( offset1, count1, offset2, count2 ) => {
+
+							// TODO: choose the triangle with the fewest triangles to transform
+							// to minimize operations.
+							for ( let i2 = offset2, l2 = offset2 + count2; i2 < l2; i2 ++ ) {
+
+								setTriangle( triangle2, i2 * 3, otherIndexAttr, otherPosAttr );
+								triangle2.a.applyMatrix4( geomToMesh );
+								triangle2.b.applyMatrix4( geomToMesh );
+								triangle2.c.applyMatrix4( geomToMesh );
+								triangle2.needsUpdate = true;
+
+								for ( let i = offset1, l = offset1 + count1; i < l; i ++ ) {
+
+									setTriangle( triangle, i * 3, indexAttr, posAttr );
+									triangle.needsUpdate = true;
+
+									if ( triangle.intersectsTriangle( triangle2 ) ) {
+
+										return true;
+
+									}
+
+								}
+
+							}
+
+							return false;
+
+						},
+
+						( box1, box2 ) => {
+
+							// TODO: we should prioritize the bounds that overlap more
+							obb.set( box2.min, box2.max, geomToMesh );
+							obb.update();
+							return obb.distanceToBox( box1 );
+
+						},
+
+						byteOffset, 0,
+
+						otherByteOffset, 0,
+
+					);
+
+					clearBuffer2();
+					otherByteOffset += otherRoot.byteLength;
+
+					if ( result ) {
+
+						break;
+
+					}
+
+
+				}
+
+				clearBuffer();
+				byteOffset += root.byteLength;
+
+				if ( result ) {
+
+					break;
+
+				}
 
 			}
 
-		}
+			return result;
 
-		return result;
+		} else {
+
+			// no bvh...
+			// use shapecast
+			if ( otherGeometry.boundingBox === null ) {
+
+				otherGeometry.computeBoundingBox();
+
+			}
+
+			const otherTriCount = otherIndexAttr ? otherIndexAttr.count : posAttr.count;
+			const boundingBox = otherGeometry.boundingBox;
+			obb.set( boundingBox.min, boundingBox.max, geomToMesh );
+			obb.update();
+			return this.shapecast( null, {
+
+				intersectsBounds: box => {
+
+					return obb.intersectsBox( box );
+
+				},
+				intersectsRange: ( offset, count ) => {
+
+					for ( let i = offset * 3, l = ( offset + count ) * 3; i < l; i += 3 ) {
+
+						setTriangle( triangle, i, indexAttr, posAttr );
+						triangle.a.applyMatrix4( meshToGeom );
+						triangle.b.applyMatrix4( meshToGeom );
+						triangle.c.applyMatrix4( meshToGeom );
+						triangle.needsUpdate = true;
+
+						for ( let i2 = 0; i2 < otherTriCount; i2 += 3 ) {
+
+							setTriangle( triangle2, i2, otherIndexAttr, otherPosAttr );
+							triangle2.needsUpdate = true;
+
+							if ( triangle.intersectsTriangle( triangle2 ) ) {
+
+								return true;
+
+							}
+
+						}
+
+					}
+
+				},
+
+			} );
+
+		}
 
 	}
 
@@ -444,7 +581,7 @@ export default class MeshBVH {
 		for ( const root of this._roots ) {
 
 			setBuffer( root );
-			result = shapecast( 0, geometry, intersectsBounds, intersectsRange, boundsTraverseOrder, byteOffset );
+			result = shapecast( 0, intersectsBounds, intersectsRange, boundsTraverseOrder, byteOffset );
 			clearBuffer();
 
 			if ( result ) {
@@ -497,9 +634,6 @@ export default class MeshBVH {
 
 		}
 
-		obb.set( otherGeometry.boundingBox.min, otherGeometry.boundingBox.max, geometryToBvh );
-		obb.update();
-
 		const geometry = this.geometry;
 		const pos = geometry.attributes.position;
 		const index = geometry.index;
@@ -521,110 +655,148 @@ export default class MeshBVH {
 		}
 
 		let closestDistance = Infinity;
-		obb2.matrix.copy( geometryToBvh ).invert();
-		this.shapecast(
-			mesh,
-			{
+		if ( otherGeometry.boundsTree ) {
 
-				boundsTraverseOrder: box => {
+			for ( const root of this._roots ) {
 
-					return obb.distanceToBox( box, Math.min( closestDistance, maxThreshold ) );
+				let byteOffset = 0;
+				setBuffer( root );
 
-				},
+				for ( const otherRoot of otherGeometry.boundsTree._roots ) {
 
-				intersectsBounds: ( box, isLeaf, score ) => {
+					let otherByteOffset = 0;
+					setBuffer2( otherRoot );
 
-					if ( score < closestDistance && score < maxThreshold ) {
+					bvhcast(
+						0, 0,
+						( box1, box2, score ) => {
 
-						// if we know the triangles of this bounds will be intersected next then
-						// save the bounds to use during triangle checks.
-						if ( isLeaf ) {
+							console.log( score, closestDistance );
 
-							obb2.min.copy( box.min );
-							obb2.max.copy( box.max );
-							obb2.update();
+							return score < closestDistance && score < maxThreshold;
 
-						}
+						},
+						( offset1, count1, offset2, count2 ) => {
 
-						return true;
+							for ( let i2 = offset2 * 3, l2 = ( offset2 + count2 ) * 3; i2 < l2; i2 += 3 ) {
 
-					}
+								setTriangle( triangle2, i2, otherIndex, otherPos );
+								triangle2.a.applyMatrix4( geometryToBvh );
+								triangle2.b.applyMatrix4( geometryToBvh );
+								triangle2.c.applyMatrix4( geometryToBvh );
+								triangle2.needsUpdate = true;
 
-					return false;
+								for ( let i = offset1 * 3, l = ( offset1 + count1 ) * 3; i < l; i += 3 ) {
 
-				},
+									setTriangle( triangle, i, index, pos );
+									triangle.needsUpdate = true;
 
-				intersectsRange: ( offset, count ) => {
+									const dist = triangle.distanceToTriangle( triangle2, tempTarget1, tempTarget2 );
+									if ( dist < closestDistance ) {
 
-					if ( otherGeometry.boundsTree ) {
+										if ( target1 ) {
 
-						// if the other geometry has a bvh then use the accelerated path where we use shapecast to find
-						// the closest bounds in the other geometry to check.
-						return otherGeometry.boundsTree.shapecast(
-							null,
-							{
-								boundsTraverseOrder: box => {
-
-									return obb2.distanceToBox( box, Math.min( closestDistance, maxThreshold ) );
-
-								},
-
-								intersectsBounds: ( box, isLeaf, score ) => {
-
-									return score < closestDistance && score < maxThreshold;
-
-								},
-
-								intersectsRange: ( otherOffset, otherCount ) => {
-
-									for ( let i2 = otherOffset * 3, l2 = ( otherOffset + otherCount ) * 3; i2 < l2; i2 += 3 ) {
-
-										setTriangle( triangle2, i2, otherIndex, otherPos );
-										triangle2.a.applyMatrix4( geometryToBvh );
-										triangle2.b.applyMatrix4( geometryToBvh );
-										triangle2.c.applyMatrix4( geometryToBvh );
-										triangle2.needsUpdate = true;
-
-										for ( let i = offset * 3, l = ( offset + count ) * 3; i < l; i += 3 ) {
-
-											setTriangle( triangle, i, index, pos );
-											triangle.needsUpdate = true;
-
-											const dist = triangle.distanceToTriangle( triangle2, tempTarget1, tempTarget2 );
-											if ( dist < closestDistance ) {
-
-												if ( target1 ) {
-
-													target1.copy( tempTarget1 );
-
-												}
-
-												if ( target2 ) {
-
-													target2.copy( tempTarget2 );
-
-												}
-
-												closestDistance = dist;
-
-											}
-
-											// stop traversal if we find a point that's under the given threshold
-											if ( dist < minThreshold ) {
-
-												return true;
-
-											}
+											target1.copy( tempTarget1 );
 
 										}
 
+										if ( target2 ) {
+
+											target2.copy( tempTarget2 );
+
+										}
+
+										closestDistance = dist;
+
 									}
 
-								},
-							}
-						);
+									// stop traversal if we find a point that's under the given threshold
+									if ( dist < minThreshold ) {
 
-					} else {
+										return true;
+
+									}
+
+								}
+
+							}
+
+
+						},
+						( box1, box2 ) => {
+
+							obb.min.copy( box2.min );
+							obb.max.copy( box2.max );
+							obb.matrix.copy( geometryToBvh );
+							obb.update();
+
+							return obb.distanceToBox( box1, Math.min( closestDistance, maxThreshold ) );
+
+						},
+						byteOffset, 0,
+						otherByteOffset, 0,
+					);
+
+					clearBuffer2();
+					otherByteOffset += otherRoot.byteLength;
+
+					if ( closestDistance < minThreshold ) {
+
+						break;
+
+					}
+
+				}
+
+				clearBuffer();
+				byteOffset += root.byteLength;
+
+				if ( closestDistance < minThreshold ) {
+
+					break;
+
+				}
+
+			}
+
+		} else {
+
+			obb.set( otherGeometry.boundingBox.min, otherGeometry.boundingBox.max, geometryToBvh );
+			obb.update();
+			obb2.matrix.copy( geometryToBvh ).invert();
+			this.shapecast(
+				mesh,
+				{
+
+					boundsTraverseOrder: box => {
+
+						return obb.distanceToBox( box, Math.min( closestDistance, maxThreshold ) );
+
+					},
+
+					intersectsBounds: ( box, isLeaf, score ) => {
+
+						if ( score < closestDistance && score < maxThreshold ) {
+
+							// if we know the triangles of this bounds will be intersected next then
+							// save the bounds to use during triangle checks.
+							if ( isLeaf ) {
+
+								obb2.min.copy( box.min );
+								obb2.max.copy( box.max );
+								obb2.update();
+
+							}
+
+							return true;
+
+						}
+
+						return false;
+
+					},
+
+					intersectsRange: ( offset, count ) => {
 
 						// If no bounds tree then we'll just check every triangle.
 						const triCount = otherIndex ? otherIndex.count : otherPos.count;
@@ -671,13 +843,13 @@ export default class MeshBVH {
 
 						}
 
-					}
+					},
 
-				},
+				}
 
-			}
+			);
 
-		);
+		}
 
 		return closestDistance;
 

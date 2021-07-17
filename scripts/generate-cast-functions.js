@@ -21,7 +21,7 @@ fs.writeFileSync( outputPath, contents );
 
 function replaceFunctionMacro( contents, name, body ) {
 
-	const functionRegexp = new RegExp( `function\\s+${ name }[^{]+{[^}]+}[\r\n]*` );
+	const functionRegexp = new RegExp( `function\\s+${ name }[^{]+{[^}]+}([\n\r]*)?` );
 	const regexp = new RegExp( `(function )?${ name }\\((.*?)\\)`, 'g' );
 	return contents
 		.replace( functionRegexp, () => {
